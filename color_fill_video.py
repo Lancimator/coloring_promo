@@ -383,7 +383,7 @@ def process_single_image(
     temp_path = finished_dir / f"_tmp_{input_path.stem}_{uuid4().hex}.mp4"
 
     # Timing for end-card sequence
-    PRE_HOLD = 3.0    # seconds of finished frame before splash appears
+    PRE_HOLD = 2.0    # seconds of finished frame before splash appears
     FADE_IN = 2.0     # slower fade-in for smoother transition
     POST_HOLD = 3.0   # seconds splash remains fully visible
     TAIL = PRE_HOLD + FADE_IN + POST_HOLD
