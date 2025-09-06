@@ -1,0 +1,9 @@
+finished/*
+!finished/.gitkeep
+!finished/colored_pics/.gitkeep
+
+music/*
+!music/.gitkeep
+
+pics/*
+!pics/.gitkeep
