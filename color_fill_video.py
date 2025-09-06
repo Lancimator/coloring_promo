@@ -534,6 +534,22 @@ def main():
     chk = ttk.Checkbutton(rand_frame, text="True random off (human-like)", variable=human_var)
     chk.pack(anchor="w")
 
+    # Randomly choose per video between human-like and true random
+    random_per_video_var = tk.BooleanVar(value=False)
+    def on_toggle_random_per_video():
+        # Grey/disable the human-like option when random-per-video is enabled
+        if random_per_video_var.get():
+            chk.config(state=tk.DISABLED)
+        else:
+            chk.config(state=tk.NORMAL)
+    random_chk = ttk.Checkbutton(
+        rand_frame,
+        text="Randomly choose mode per video",
+        variable=random_per_video_var,
+        command=on_toggle_random_per_video,
+    )
+    random_chk.pack(anchor="w")
+
     # Progress
     pbar = ttk.Progressbar(frm, mode="determinate", maximum=100)
     pbar.pack(fill=tk.X, pady=(16, 0))
@@ -565,12 +581,25 @@ def main():
         def worker():
             try:
                 imgs_cycle = list(images)
+                # Shuffle the images so selection is random per batch
+                img_rng = random.SystemRandom()
+                if len(imgs_cycle) > 1:
+                    imgs_cycle = img_rng.sample(imgs_cycle, len(imgs_cycle))
                 total = n
+                # Use a cryptographically-strong RNG for mode selection to avoid any prior seeding
+                mode_rng = random.SystemRandom()
                 for i in range(n):
                     if cancel_flag["stop"]:
                         break
                     img_path = imgs_cycle[i % len(imgs_cycle)]
-                    status_var.set(f"Processing {i+1}/{total}: {img_path.name}")
+                    # Decide coloring mode for this video
+                    if random_per_video_var.get():
+                        current_human_like = bool(mode_rng.getrandbits(1))
+                    else:
+                        current_human_like = bool(human_var.get())
+
+                    mode_label = "human-like" if current_human_like else "true random"
+                    status_var.set(f"Processing {i+1}/{total}: {img_path.name} ({mode_label})")
                     root.update_idletasks()
                     process_single_image(
                         img_path,
@@ -583,7 +612,7 @@ def main():
                         EXCLUDE_TOP,
                         EXCLUDE_BOTTOM,
                         CODEC,
-                        human_var.get(),
+                        current_human_like,
                     )
                     pbar.config(value=((i + 1) / total) * 100)
             except Exception as e:
