@@ -1,6 +1,6 @@
 import random
 import math
-from typing import Tuple
+from typing import Tuple, List
 from pathlib import Path
 import os
 from uuid import uuid4
@@ -22,17 +22,96 @@ from tkinter import ttk, messagebox
 import itertools
 
 
-def random_vivid_bgr(rng: random.Random) -> Tuple[int, int, int]:
-    """Return a pleasant, vivid random BGR color.
+def _palette_bgr() -> List[Tuple[int, int, int]]:
+    """Fixed allowed palette in BGR order for OpenCV.
 
-    We sample in HSV space keeping saturation/value high, then convert to BGR.
+    Colors mirror the provided set:
+    RED, GREEN, BLUE, YELLOW, CYAN, MAGENTA, DKGRAY, LTGRAY,
+    orange(255,165,0), brown(139,69,19), pink(255,192,203), purple(128,0,128),
+    teal(0,128,128), gold(255,215,0), dark green(0,128,0), maroon(128,0,0),
+    steel blue(70,130,180), tomato(255,99,71), turquoise(64,224,208)
     """
-    h = rng.uniform(0, 179)  # OpenCV Hue range [0,179]
-    s = rng.uniform(140, 255)
-    v = rng.uniform(160, 255)
-    hsv = np.uint8([[[h, s, v]]])
-    bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0, 0]
-    return int(bgr[0]), int(bgr[1]), int(bgr[2])
+    rgb = [
+        (255, 0, 0),      # RED
+        (0, 255, 0),      # GREEN
+        (0, 0, 255),      # BLUE
+        (255, 255, 0),    # YELLOW
+        (0, 255, 255),    # CYAN
+        (255, 0, 255),    # MAGENTA
+        (68, 68, 68),     # DKGRAY (Android Color.DKGRAY)
+        (204, 204, 204),  # LTGRAY (Android Color.LTGRAY)
+        (255, 165, 0),    # ORANGE
+        (139, 69, 19),    # BROWN
+        (255, 192, 203),  # PINK
+        (128, 0, 128),    # PURPLE
+        (0, 128, 128),    # TEAL
+        (255, 215, 0),    # GOLD
+        (0, 128, 0),      # DARK GREEN
+        (128, 0, 0),      # MAROON
+        (70, 130, 180),   # STEEL BLUE
+        (255, 99, 71),    # TOMATO
+        (64, 224, 208),   # TURQUOISE
+    ]
+    return [(b, g, r) for (r, g, b) in rgb]
+
+
+PALETTE_BGR = _palette_bgr()
+
+# Sub-palettes for human-like mode (avoid neutrals to keep image lively)
+HUMAN_VIVID_BGR: List[Tuple[int, int, int]] = [
+    c for c in PALETTE_BGR
+    if c not in [
+        (255, 255, 255),           # white in BGR
+        (68, 68, 68),              # dkgray
+        (204, 204, 204),           # ltgray
+    ]
+]
+
+# Warm/cool grouping from allowed palette
+HUMAN_WARM: List[Tuple[int, int, int]] = [
+    (0, 0, 255),      # RED
+    (0, 165, 255),    # ORANGE
+    (0, 215, 255),    # GOLD/YELLOW-ish
+    (71, 99, 255),    # TOMATO
+    (203, 192, 255),  # PINK
+    (0, 0, 128),      # PURPLE (BGR)
+    (19, 69, 139),    # BROWN (BGR from RGB(139,69,19))
+    (0, 0, 128),      # MAROON approximated already included, keep once
+]
+HUMAN_COOL: List[Tuple[int, int, int]] = [
+    (255, 0, 0),      # BLUE
+    (255, 255, 0),    # CYAN
+    (128, 128, 0),    # TEAL (BGR from RGB(0,128,128))
+    (208, 224, 64),   # TURQUOISE (BGR from RGB(64,224,208))
+    (180, 130, 70),   # STEEL BLUE (BGR from RGB(70,130,180))
+    (0, 128, 0),      # GREEN
+    (0, 128, 0),      # DARK GREEN (same BGR)
+]
+
+
+def random_vivid_bgr(rng: random.Random) -> Tuple[int, int, int]:
+    """Pick a random color from the fixed allowed palette (BGR)."""
+    return rng.choice(PALETTE_BGR)
+
+
+def generate_human_palette(rng: random.Random, n: int = 16) -> List[Tuple[int, int, int]]:
+    """Return a pleasant palette order using only allowed colors.
+
+    Mixes warm and cool lists to keep harmony, avoiding white/greys.
+    """
+    warm = HUMAN_WARM.copy()
+    cool = HUMAN_COOL.copy()
+    rng.shuffle(warm)
+    rng.shuffle(cool)
+    merged = list(itertools.chain.from_iterable(zip(warm, cool)))
+    # If uneven lengths, append remainder
+    if len(warm) != len(cool):
+        tail = warm[len(cool):] if len(warm) > len(cool) else cool[len(warm):]
+        merged.extend(tail)
+    # Ensure we have enough colors
+    while len(merged) < n:
+        merged.extend(merged)
+    return merged[:n]
 
 
 def compute_masks(
@@ -87,6 +166,9 @@ def fill_regions_progressively(
     exclude_bottom_px: int = 500,
     codec: str = "mp4v",
     output_path: str = "output.mp4",
+    human_like: bool = False,
+    min_region_area: int = 100,
+    tail_secs: float = 7.0,
 ):
     """Fill white regions with random colors and write an animation video.
 
@@ -104,9 +186,9 @@ def fill_regions_progressively(
         exclude_bottom_px=exclude_bottom_px,
     )
 
-    # Connected components on white regions
+    # Connected components with stats/centroids for white regions
     # Use 4-connectivity to respect thin line boundaries
-    num_labels, labels = cv2.connectedComponents(white_mask, connectivity=4)
+    num_labels, labels, stats, cents = cv2.connectedComponentsWithStats(white_mask, connectivity=4)
 
     # Exclude any white region that touches the image border (likely background)
     h_idx = [0, img_bgr.shape[0]-1]
@@ -119,15 +201,39 @@ def fill_regions_progressively(
         col = labels[:, c]
         border_labels.update(np.unique(col[col > 0]).tolist())
 
-    region_ids = [rid for rid in range(1, num_labels) if rid not in border_labels]
+    region_ids = [
+        rid
+        for rid in range(1, num_labels)
+        if rid not in border_labels and stats[rid, cv2.CC_STAT_AREA] >= max(1, int(min_region_area))
+    ]
+
+    # Optionally order regions like a human would color (spatially coherent)
+    if human_like and region_ids:
+        h_img, w_img = img_bgr.shape[:2]
+        center = np.array([h_img / 2.0, w_img / 2.0])
+        centroids = {rid: np.array([cents[rid][1], cents[rid][0]]) for rid in region_ids}  # y,x -> row,col
+        # Start near center
+        start = min(region_ids, key=lambda rid: np.linalg.norm(centroids[rid] - center))
+        ordered = [start]
+        remaining = set(region_ids)
+        remaining.remove(start)
+        current = start
+        while remaining:
+            next_rid = min(remaining, key=lambda rid: np.linalg.norm(centroids[rid] - centroids[current]))
+            ordered.append(next_rid)
+            remaining.remove(next_rid)
+            current = next_rid
+        region_ids = ordered
 
     if len(region_ids) == 0:
         raise ValueError("No white regions detected to fill.")
 
-    rng.shuffle(region_ids)
+    if not human_like:
+        rng.shuffle(region_ids)
 
     # Decide how many regions to color per emitted frame
-    regions_per_frame = max(1, math.ceil(len(region_ids) / total_frames_target))
+    # For human-like mode, emit a frame for every colored region to reduce pauses.
+    regions_per_frame = 1 if human_like else max(1, math.ceil(len(region_ids) / total_frames_target))
 
     # Prepare the writer
     fourcc = cv2.VideoWriter_fourcc(*codec)
@@ -143,9 +249,52 @@ def fill_regions_progressively(
         colored = np.zeros_like(white_mask, dtype=bool)
 
         kernel_dilate = np.ones((2, 2), np.uint8)
+        palette = generate_human_palette(rng, n=16) if human_like else None
+        last_color = None
+        # In human-like mode, keep using the same color for a run of regions
+        run_remaining = 0
+
+        # Build a simple neighbor map to reduce same-color touching
+        neighbor_map: dict[int, set[int]] = {}
+        if human_like:
+            lab = labels
+            k3 = np.ones((3, 3), np.uint8)
+            for rid in region_ids:
+                x, y, w, h = stats[rid, cv2.CC_STAT_LEFT], stats[rid, cv2.CC_STAT_TOP], stats[rid, cv2.CC_STAT_WIDTH], stats[rid, cv2.CC_STAT_HEIGHT]
+                y0 = max(0, y - 1)
+                x0 = max(0, x - 1)
+                y1 = min(lab.shape[0], y + h + 1)
+                x1 = min(lab.shape[1], x + w + 1)
+                window = lab[y0:y1, x0:x1]
+                m = (window == rid).astype(np.uint8) * 255
+                md = cv2.dilate(m, k3, iterations=1)
+                ring = (md > 0) & (m == 0)
+                neigh = set(np.unique(window[ring]).tolist())
+                neigh.discard(0)
+                neigh.discard(rid)
+                neighbor_map[rid] = neigh
+
+        assigned_color: dict[int, Tuple[int, int, int]] = {}
         for i, region_id in enumerate(region_ids, start=1):
             # Assign a color for this region
-            color = random_vivid_bgr(rng)
+            if human_like:
+                if run_remaining <= 0 or last_color is None:
+                    # Start a new color run (longer runs -> more same color usage)
+                    last_color = palette[(i // 3) % len(palette)]  # slowly rotate palette
+                    run_remaining = rng.randint(4, 10)  # use same color across 4–10 regions
+                # Try to avoid matching already-colored neighbors
+                neighbor_colors = {assigned_color.get(n) for n in neighbor_map.get(region_id, set())}
+                neighbor_colors.discard(None)
+                color = last_color
+                if color in neighbor_colors:
+                    # pick an alternative from the same palette
+                    for c_try in palette:
+                        if c_try not in neighbor_colors:
+                            color = c_try
+                            break
+                run_remaining -= 1
+            else:
+                color = random_vivid_bgr(rng)
             mask = labels == region_id
             # Slightly dilate region mask to cover tiny gaps, but never over lines
             m8 = (mask.astype(np.uint8) * 255)
@@ -153,6 +302,7 @@ def fill_regions_progressively(
             mask = (m8 > 0) & (~line_mask.astype(bool))
             colored |= mask
             current[mask] = color
+            assigned_color[region_id] = color
 
             # Emit a frame every `regions_per_frame` colored regions
             if i % regions_per_frame == 0:
@@ -162,11 +312,11 @@ def fill_regions_progressively(
                 writer.write(frame)
                 frames_written += 1
 
-        # After finishing all regions, hold the final image for 7 seconds
-        # (3s plain, then 1s logo fade-in + 3s hold handled during composition)
+        # After finishing all regions, hold the final image for tail_secs seconds
+        # (composition may place splash over a portion of this tail)
         final_frame = current.copy()
         final_frame[line_mask.astype(bool)] = (0, 0, 0)
-        tail_frames = int(round(7 * fps))
+        tail_frames = int(round(tail_secs * fps))
         for _ in range(tail_frames):
             writer.write(final_frame)
             frames_written += 1
@@ -224,12 +374,19 @@ def process_single_image(
     EXCLUDE_TOP: int,
     EXCLUDE_BOTTOM: int,
     CODEC: str,
+    HUMAN_LIKE: bool,
 ):
     img = cv2.imread(str(input_path), cv2.IMREAD_COLOR)
     if img is None:
         raise FileNotFoundError(f"Could not read image: {input_path}")
 
     temp_path = finished_dir / f"_tmp_{input_path.stem}_{uuid4().hex}.mp4"
+
+    # Timing for end-card sequence
+    PRE_HOLD = 3.0    # seconds of finished frame before splash appears
+    FADE_IN = 2.0     # slower fade-in for smoother transition
+    POST_HOLD = 3.0   # seconds splash remains fully visible
+    TAIL = PRE_HOLD + FADE_IN + POST_HOLD
 
     frames_written, out_fps, final_frame = fill_regions_progressively(
         img,
@@ -242,6 +399,9 @@ def process_single_image(
         exclude_bottom_px=EXCLUDE_BOTTOM,
         codec=CODEC,
         output_path=str(temp_path),
+        human_like=HUMAN_LIKE,
+        min_region_area=100,
+        tail_secs=TAIL,
     )
 
     # Save last frame
@@ -274,20 +434,23 @@ def process_single_image(
     if logo_path is not None and logo_path.exists():
         # Full-screen overlay: match the video frame size
         logo_clip = ImageClip(str(logo_path)).resize((base_clip.w, base_clip.h))
-        # Start 4 seconds before the end (after 3 seconds of final image)
-        start_t = max(0, video_duration - 4.0)
-        logo_duration = min(4.0, video_duration - start_t)
-        logo_clip = logo_clip.set_start(start_t).set_duration(logo_duration)
-        logo_clip = logo_clip.fx(vfx.fadein, 1.0)
-        logo_clip = logo_clip.set_position((0, 0))
-        # Add a black fade-in layer under the logo for a smoother transition
-        black_fade = (
-            ColorClip(size=base_clip.size, color=(0, 0, 0))
+        # Start so that we keep PRE_HOLD seconds with no overlay, then FADE_IN + POST_HOLD
+        start_t = max(0, video_duration - (FADE_IN + POST_HOLD))
+        logo_duration = min(FADE_IN + POST_HOLD, video_duration - start_t)
+        # Create a mask that fades from transparent (0) to opaque (1)
+        mask_clip = (
+            ColorClip(size=base_clip.size, color=1, ismask=True)
             .set_start(start_t)
             .set_duration(logo_duration)
-            .fx(vfx.fadein, 1.0)
+            .fx(vfx.fadein, FADE_IN)
         )
-        overlays.extend([black_fade, logo_clip])
+        logo_clip = (
+            logo_clip.set_start(start_t)
+            .set_duration(logo_duration)
+            .set_mask(mask_clip)
+            .set_position((0, 0))
+        )
+        overlays.append(logo_clip)
 
     final_clip = CompositeVideoClip([base_clip] + overlays, size=base_clip.size)
 
@@ -333,6 +496,7 @@ def main():
     EXCLUDE_TOP = 500
     EXCLUDE_BOTTOM = 500
     CODEC = "mp4v"  # try "MJPG" if mp4v doesn't work on your system
+    MIN_REGION_AREA = 100  # ignore regions smaller than 10x10 pixels
 
     base_dir = Path(__file__).resolve().parent
     pics_dir = base_dir / "pics"
@@ -344,7 +508,7 @@ def main():
     # Build GUI --------------------------------------------------------------
     root = tk.Tk()
     root.title("Color Fill Video Generator")
-    root.geometry("420x220")
+    root.geometry("460x260")
 
     frm = ttk.Frame(root, padding=12)
     frm.pack(expand=True, fill=tk.BOTH)
@@ -362,6 +526,13 @@ def main():
     num_var = tk.IntVar(value=max(1, len(images) or 1))
     spn = ttk.Spinbox(row, from_=1, to=9999, textvariable=num_var, width=8)
     spn.pack(side=tk.LEFT, padx=(8, 0))
+
+    # True random off (human-like coloring)
+    rand_frame = ttk.Frame(frm)
+    rand_frame.pack(fill=tk.X, pady=(12, 0))
+    human_var = tk.BooleanVar(value=False)
+    chk = ttk.Checkbutton(rand_frame, text="True random off (human-like)", variable=human_var)
+    chk.pack(anchor="w")
 
     # Progress
     pbar = ttk.Progressbar(frm, mode="determinate", maximum=100)
@@ -412,6 +583,7 @@ def main():
                         EXCLUDE_TOP,
                         EXCLUDE_BOTTOM,
                         CODEC,
+                        human_var.get(),
                     )
                     pbar.config(value=((i + 1) / total) * 100)
             except Exception as e:
