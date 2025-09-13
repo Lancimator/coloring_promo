@@ -169,6 +169,7 @@ def fill_regions_progressively(
     human_like: bool = False,
     min_region_area: int = 100,
     tail_secs: float = 7.0,
+    max_colors: int | None = None,
 ):
     """Fill white regions with random colors and write an animation video.
 
@@ -249,7 +250,40 @@ def fill_regions_progressively(
         colored = np.zeros_like(white_mask, dtype=bool)
 
         kernel_dilate = np.ones((2, 2), np.uint8)
-        palette = generate_human_palette(rng, n=16) if human_like else None
+        # Decide the set of colors allowed for this run (limit by max_colors)
+        # For non-human mode, use a random subset of PALETTE_BGR.
+        # For human-like mode, derive an ordered palette then reduce to unique up to the limit.
+        limit = None
+        if max_colors is None:
+            limit = None
+        else:
+            try:
+                limit = int(max_colors)
+            except Exception:
+                limit = None
+        if limit is not None:
+            limit = max(1, min(limit, len(PALETTE_BGR)))
+
+        if human_like:
+            # Build a pleasant sequence first, then keep unique colors up to the limit
+            seq = generate_human_palette(rng, n=max(16, (limit or 16)))
+            uniq: List[Tuple[int, int, int]] = []
+            for c in seq:
+                if c not in uniq:
+                    uniq.append(c)
+                if limit is not None and len(uniq) >= limit:
+                    break
+            if not uniq:
+                uniq = [random_vivid_bgr(rng)]
+            palette = uniq
+            allowed_colors = palette
+        else:
+            if limit is None or limit >= len(PALETTE_BGR):
+                allowed_colors = list(PALETTE_BGR)
+            else:
+                # Choose a stable random subset for this run
+                allowed_colors = rng.sample(PALETTE_BGR, k=limit)
+            palette = None
         last_color = None
         # In human-like mode, keep using the same color for a run of regions
         run_remaining = 0
@@ -294,7 +328,8 @@ def fill_regions_progressively(
                             break
                 run_remaining -= 1
             else:
-                color = random_vivid_bgr(rng)
+                # Pick from the limited allowed palette
+                color = rng.choice(allowed_colors)
             mask = labels == region_id
             # Slightly dilate region mask to cover tiny gaps, but never over lines
             m8 = (mask.astype(np.uint8) * 255)
@@ -375,6 +410,7 @@ def process_single_image(
     EXCLUDE_BOTTOM: int,
     CODEC: str,
     HUMAN_LIKE: bool,
+    MAX_COLORS: int,
 ):
     img = cv2.imread(str(input_path), cv2.IMREAD_COLOR)
     if img is None:
@@ -402,6 +438,7 @@ def process_single_image(
         human_like=HUMAN_LIKE,
         min_region_area=100,
         tail_secs=TAIL,
+        max_colors=MAX_COLORS,
     )
 
     # Save last frame
@@ -508,7 +545,7 @@ def main():
     # Build GUI --------------------------------------------------------------
     root = tk.Tk()
     root.title("Color Fill Video Generator")
-    root.geometry("460x260")
+    root.geometry("460x320")
 
     frm = ttk.Frame(root, padding=12)
     frm.pack(expand=True, fill=tk.BOTH)
@@ -549,6 +586,37 @@ def main():
         command=on_toggle_random_per_video,
     )
     random_chk.pack(anchor="w")
+
+    # Max distinct colors per video slider
+    colors_frame = ttk.Frame(frm)
+    colors_frame.pack(fill=tk.X, pady=(12, 0))
+    ttk.Label(colors_frame, text="Max different colors per video:").pack(anchor="w")
+    colors_row = ttk.Frame(colors_frame)
+    colors_row.pack(fill=tk.X)
+    max_colors_var = tk.IntVar(value=len(PALETTE_BGR))
+    scale_var = tk.DoubleVar(value=float(len(PALETTE_BGR)))
+
+    lbl_val = ttk.Label(colors_row, text=str(len(PALETTE_BGR)))
+
+    def on_colors_scale(v):
+        try:
+            val = int(round(float(v)))
+        except Exception:
+            val = len(PALETTE_BGR)
+        val = max(1, min(val, len(PALETTE_BGR)))
+        max_colors_var.set(val)
+        lbl_val.config(text=str(val))
+
+    scl = ttk.Scale(
+        colors_row,
+        from_=1,
+        to=len(PALETTE_BGR),
+        orient=tk.HORIZONTAL,
+        variable=scale_var,
+        command=on_colors_scale,
+    )
+    scl.pack(side=tk.LEFT, expand=True, fill=tk.X)
+    lbl_val.pack(side=tk.LEFT, padx=(8, 0))
 
     # Progress
     pbar = ttk.Progressbar(frm, mode="determinate", maximum=100)
@@ -613,6 +681,7 @@ def main():
                         EXCLUDE_BOTTOM,
                         CODEC,
                         current_human_like,
+                        int(max_colors_var.get()),
                     )
                     pbar.config(value=((i + 1) / total) * 100)
             except Exception as e:
