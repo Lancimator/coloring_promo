@@ -20,6 +20,243 @@ from moviepy.editor import (
 import tkinter as tk
 from tkinter import ttk, messagebox
 import itertools
+from dataclasses import dataclass
+
+
+# Optional OCR support: if pytesseract is available, we'll leverage it to
+# locate the "current color" label. Otherwise, we fall back to circle search.
+try:
+    import pytesseract  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    pytesseract = None  # type: ignore
+
+
+@dataclass
+class Circle:
+    x: int
+    y: int
+    r: int
+
+
+def _clip_rect(x0: int, y0: int, x1: int, y1: int, w: int, h: int) -> tuple[int, int, int, int]:
+    x0 = max(0, min(x0, w))
+    y0 = max(0, min(y0, h))
+    x1 = max(0, min(x1, w))
+    y1 = max(0, min(y1, h))
+    if x1 < x0:
+        x0, x1 = x1, x0
+    if y1 < y0:
+        y0, y1 = y1, y0
+    return x0, y0, x1, y1
+
+
+def _find_circles_hough(img_bgr: np.ndarray, min_r: int = 6, max_r: int | None = None) -> list[Circle]:
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    gray = cv2.medianBlur(gray, 5)
+    h, w = gray.shape[:2]
+    if max_r is None:
+        max_r = max(10, min(h, w) // 6)
+    circles = cv2.HoughCircles(
+        gray,
+        cv2.HOUGH_GRADIENT,
+        dp=1.2,
+        minDist=max(12, min(h, w) // 20),
+        param1=120,
+        param2=20,
+        minRadius=min_r,
+        maxRadius=max_r,
+    )
+    found: list[Circle] = []
+    if circles is not None:
+        for c in circles[0, :]:
+            cx, cy, r = int(round(c[0])), int(round(c[1])), int(round(c[2]))
+            found.append(Circle(cx, cy, r))
+    return found
+
+
+def _score_circle_by_saturation(img_bgr: np.ndarray, circ: Circle) -> float:
+    # Mean saturation inside the circle; higher favors vivid swatches
+    x, y, r = circ.x, circ.y, circ.r
+    h, w = img_bgr.shape[:2]
+    x0, y0 = max(0, x - r), max(0, y - r)
+    x1, y1 = min(w, x + r), min(h, y + r)
+    roi = img_bgr[y0:y1, x0:x1]
+    if roi.size == 0:
+        return -1.0
+    yy, xx = np.ogrid[0:roi.shape[0], 0:roi.shape[1]]
+    mask = (xx - (x - x0)) ** 2 + (yy - (y - y0)) ** 2 <= r * r
+    if not np.any(mask):
+        return -1.0
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    sat = hsv[:, :, 1]
+    return float(np.mean(sat[mask]))
+
+
+def _detect_circle_near_text_with_ocr(img_bgr: np.ndarray) -> Circle | None:
+    if pytesseract is None:
+        return None
+    try:
+        rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        data = pytesseract.image_to_data(rgb, output_type='dict')  # type: ignore
+    except Exception:
+        return None
+    n = len(data.get('text', []))
+    # Build words with positions
+    words = []
+    for i in range(n):
+        t = data['text'][i]
+        try:
+            conf = float(data['conf'][i])
+        except Exception:
+            conf = -1.0
+        if not t or t.isspace() or conf < 0:
+            continue
+        x, y, w, h = int(data['left'][i]), int(data['top'][i]), int(data['width'][i]), int(data['height'][i])
+        words.append((t, x, y, w, h))
+    # Search for sequence "current" + "color" (case-insensitive)
+    target_rect = None
+    for i in range(len(words) - 1):
+        w1, x1, y1, ww1, hh1 = words[i]
+        w2, x2, y2, ww2, hh2 = words[i + 1]
+        if w1.lower() == 'current' and w2.lower() == 'color':
+            x0 = min(x1, x2)
+            y0 = min(y1, y2)
+            x1b = max(x1 + ww1, x2 + ww2)
+            y1b = max(y1 + hh1, y2 + hh2)
+            target_rect = (x0, y0, x1b, y1b)
+            break
+    if target_rect is None:
+        # Also consider the single token "currentcolor" if OCR fused it
+        for t, x, y, w, h in words:
+            if t.lower().replace(" ", "") == "currentcolor":
+                target_rect = (x, y, x + w, y + h)
+                break
+    if target_rect is None:
+        return None
+    h_img, w_img = img_bgr.shape[:2]
+    x0, y0, x1, y1 = _clip_rect(*target_rect, w_img, h_img)
+    rect_h = max(1, y1 - y0)
+    # Probe to the right first
+    search_w = rect_h * 6
+    rx0, ry0, rx1, ry1 = _clip_rect(x1, y0 - rect_h, x1 + search_w, y1 + rect_h * 2, w_img, h_img)
+    probe_right = img_bgr[ry0:ry1, rx0:rx1]
+    candidates = _find_circles_hough(probe_right)
+    if candidates:
+        # Adjust to full-image coords and pick max-saturation
+        adjusted = [Circle(c.x + rx0, c.y + ry0, c.r) for c in candidates]
+        best = max(adjusted, key=lambda c: _score_circle_by_saturation(img_bgr, c))
+        return best
+    # Probe to the left as fallback
+    lx0, ly0, lx1, ly1 = _clip_rect(x0 - search_w, y0 - rect_h, x0, y1 + rect_h * 2, w_img, h_img)
+    probe_left = img_bgr[ly0:ly1, lx0:lx1]
+    candidates = _find_circles_hough(probe_left)
+    if candidates:
+        adjusted = [Circle(c.x + lx0, c.y + ly0, c.r) for c in candidates]
+        best = max(adjusted, key=lambda c: _score_circle_by_saturation(img_bgr, c))
+        return best
+    return None
+
+
+def _detect_ui_color_circle(
+    img_bgr: np.ndarray,
+    exclude_top_px: int = 0,
+    exclude_bottom_px: int = 0,
+) -> Circle | None:
+    # Prefer OCR-based detection
+    circ = _detect_circle_near_text_with_ocr(img_bgr)
+    if circ is not None:
+        return circ
+    # Fallback: search top/bottom excluded bands for vivid circles
+    h, w = img_bgr.shape[:2]
+    bands: list[tuple[int, int, int, int]] = []
+    if exclude_top_px > 0:
+        bands.append((0, 0, w, min(h, exclude_top_px)))
+    if exclude_bottom_px > 0:
+        bands.append((0, max(0, h - exclude_bottom_px), w, h))
+    best: Circle | None = None
+    best_score = -1.0
+    for (x0, y0, x1, y1) in bands:
+        roi = img_bgr[y0:y1, x0:x1]
+        if roi.size == 0:
+            continue
+        for c in _find_circles_hough(roi):
+            adj = Circle(c.x + x0, c.y + y0, c.r)
+            score = _score_circle_by_saturation(img_bgr, adj)
+            if score > best_score:
+                best_score = score
+                best = adj
+    return best
+
+
+def _draw_ui_circle(
+    frame_bgr: np.ndarray,
+    circ: Circle,
+    color_bgr: tuple[int, int, int],
+    inflate_px: int = 3,
+    inflate_scale: float = 1.12,
+) -> None:
+    # Fill the circle with the provided color, slightly inflated to hide any background fringe.
+    if circ is None:
+        return
+    h, w = frame_bgr.shape[:2]
+    if circ.x < 0 or circ.y < 0 or circ.x >= w or circ.y >= h or circ.r <= 0:
+        return
+    r = int(round(max(circ.r * float(inflate_scale), circ.r + float(inflate_px))))
+    r = max(1, r)
+    cv2.circle(
+        frame_bgr,
+        (int(circ.x), int(circ.y)),
+        r,
+        color_bgr,
+        thickness=-1,
+        lineType=cv2.LINE_AA,
+    )
+
+
+def _find_circle_near_point(
+    img_bgr: np.ndarray,
+    pt: tuple[int, int],
+    search_radius: int = 120,
+) -> Circle | None:
+    x, y = int(pt[0]), int(pt[1])
+    h, w = img_bgr.shape[:2]
+    x0, y0, x1, y1 = _clip_rect(x - search_radius, y - search_radius, x + search_radius, y + search_radius, w, h)
+    roi = img_bgr[y0:y1, x0:x1]
+    if roi.size == 0:
+        return None
+    cands = _find_circles_hough(roi)
+    if not cands:
+        return None
+    # Choose the candidate whose center is nearest to the requested point
+    best = min(cands, key=lambda c: (c.x + x0 - x) ** 2 + (c.y + y0 - y) ** 2)
+    return Circle(best.x + x0, best.y + y0, best.r)
+
+
+def _resolve_ui_circle(
+    img_bgr: np.ndarray,
+    exclude_top_px: int = 0,
+    exclude_bottom_px: int = 0,
+    override_pos: tuple[int, int] | tuple[float, float] | None = None,
+    pos_is_normalized: bool = False,
+    search_radius: int | None = None,
+) -> Circle | None:
+    h, w = img_bgr.shape[:2]
+    if override_pos is not None:
+        if pos_is_normalized:
+            x = int(round(float(override_pos[0]) * w))
+            y = int(round(float(override_pos[1]) * h))
+        else:
+            x = int(round(float(override_pos[0])))
+            y = int(round(float(override_pos[1])))
+        sr = int(search_radius if search_radius is not None else max(40, min(h, w) // 8))
+        circ = _find_circle_near_point(img_bgr, (x, y), search_radius=sr)
+        if circ is not None:
+            return circ
+        # Fallback: assume a sensible radius if Hough misses
+        r_guess = max(8, min(h, w) // 30)
+        return Circle(x, y, r_guess)
+    # No override -> use automatic detection
+    return _detect_ui_color_circle(img_bgr, exclude_top_px=exclude_top_px, exclude_bottom_px=exclude_bottom_px)
 
 
 def _palette_bgr() -> List[Tuple[int, int, int]]:
@@ -120,6 +357,7 @@ def compute_masks(
     black_thresh: int = 50,
     exclude_top_px: int = 0,
     exclude_bottom_px: int = 0,
+    exclude_rect: tuple[int, int, int, int] | None = None,
 ):
     """Compute masks for white fillable regions and linework (black).
 
@@ -130,7 +368,11 @@ def compute_masks(
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
     # Black lines (and black shapes) mask
+    # Treat more near-black as line to protect borders
     _, line_mask = cv2.threshold(gray, black_thresh, 255, cv2.THRESH_BINARY_INV)
+    # Slightly dilate line mask so coloring never touches the outlines
+    kernel_line = np.ones((3, 3), np.uint8)
+    line_mask = cv2.dilate(line_mask, kernel_line, iterations=1)
 
     # White areas mask – accept "near white" as fillable
     _, white_mask = cv2.threshold(gray, white_thresh, 255, cv2.THRESH_BINARY)
@@ -140,6 +382,7 @@ def compute_masks(
 
     # Close tiny gaps and hug outlines to avoid unfilled fringes near lines
     kernel = np.ones((3, 3), np.uint8)
+    # Close small gaps so region masks hug outlines better (but keep off lines)
     white_mask = cv2.morphologyEx(white_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
     # Ensure we didn't grow into lines
     white_mask = cv2.bitwise_and(white_mask, cv2.bitwise_not(line_mask))
@@ -152,6 +395,20 @@ def compute_masks(
         white_mask[:top_end, :] = 0
     if bottom_start < h:
         white_mask[bottom_start:, :] = 0
+    # Exclude an arbitrary rectangle if provided (x0,y0,x1,y1)
+    if exclude_rect is not None:
+        x0, y0, x1, y1 = exclude_rect
+        H, W = white_mask.shape[:2]
+        x0 = max(0, min(int(x0), W))
+        x1 = max(0, min(int(x1), W))
+        y0 = max(0, min(int(y0), H))
+        y1 = max(0, min(int(y1), H))
+        if x1 < x0:
+            x0, x1 = x1, x0
+        if y1 < y0:
+            y0, y1 = y1, y0
+        if x1 > x0 and y1 > y0:
+            white_mask[y0:y1, x0:x1] = 0
     return white_mask, line_mask
 
 
@@ -170,6 +427,12 @@ def fill_regions_progressively(
     min_region_area: int = 100,
     tail_secs: float = 7.0,
     max_colors: int | None = None,
+    accelerate: bool = False,
+    ui_circle_pos: tuple[int, int] | tuple[float, float] | None = None,
+    ui_circle_pos_is_normalized: bool = False,
+    ui_circle_search_radius: int | None = None,
+    exclude_rect: tuple[int, int, int, int] | None = None,
+    pattern: str | None = None,
 ):
     """Fill white regions with random colors and write an animation video.
 
@@ -185,6 +448,17 @@ def fill_regions_progressively(
         black_thresh=black_thresh,
         exclude_top_px=exclude_top_px,
         exclude_bottom_px=exclude_bottom_px,
+        exclude_rect=exclude_rect,
+    )
+
+    # Try to detect the UI "current color" circle once so we can update it per frame
+    ui_circle = _resolve_ui_circle(
+        img_bgr,
+        exclude_top_px=exclude_top_px,
+        exclude_bottom_px=exclude_bottom_px,
+        override_pos=ui_circle_pos,
+        pos_is_normalized=ui_circle_pos_is_normalized,
+        search_radius=ui_circle_search_radius,
     )
 
     # Connected components with stats/centroids for white regions
@@ -209,7 +483,7 @@ def fill_regions_progressively(
     ]
 
     # Optionally order regions like a human would color (spatially coherent)
-    if human_like and region_ids:
+    if human_like and region_ids and (pattern is None or str(pattern).lower() in ("", "auto")):
         h_img, w_img = img_bgr.shape[:2]
         center = np.array([h_img / 2.0, w_img / 2.0])
         centroids = {rid: np.array([cents[rid][1], cents[rid][0]]) for rid in region_ids}  # y,x -> row,col
@@ -232,8 +506,51 @@ def fill_regions_progressively(
     if not human_like:
         rng.shuffle(region_ids)
 
+    # Apply explicit pattern ordering if requested (overrides the above ordering)
+    if pattern is not None and str(pattern).lower() not in ("", "auto") and region_ids:
+        mode = str(pattern).lower().strip()
+        h_img, w_img = img_bgr.shape[:2]
+        cy, cx = h_img / 2.0, w_img / 2.0
+        # Use provided component centroids
+        cents_map = {rid: (float(cents[rid][1]), float(cents[rid][0])) for rid in region_ids}  # (y,x)
+        def key_top_to_bottom(rid: int):
+            y, x = cents_map[rid]
+            return (y, x)
+        def key_left_to_right(rid: int):
+            y, x = cents_map[rid]
+            return (x, y)
+        def key_center_out(rid: int):
+            y, x = cents_map[rid]
+            return (math.hypot(y - cy, x - cx), y, x)
+        def key_angle_sweep(rid: int):
+            y, x = cents_map[rid]
+            ang = math.atan2(y - cy, x - cx)
+            return (ang, math.hypot(y - cy, x - cx))
+        if mode in ("top-to-bottom", "top_to_bottom", "vertical"):
+            region_ids = sorted(region_ids, key=key_top_to_bottom)
+        elif mode in ("left-to-right", "left_to_right", "horizontal"):
+            region_ids = sorted(region_ids, key=key_left_to_right)
+        elif mode in ("center-out", "center_out", "radial"):
+            region_ids = sorted(region_ids, key=key_center_out)
+        elif mode in ("angle", "angle-sweep", "spiral", "cw"):
+            region_ids = sorted(region_ids, key=key_angle_sweep)
+        elif mode in ("special",):
+            # Alternate near/far from center for a dynamic visual
+            ordered = sorted(region_ids, key=key_center_out)
+            i, j = 0, len(ordered) - 1
+            woven = []
+            while i <= j:
+                if i == j:
+                    woven.append(ordered[i])
+                else:
+                    woven.append(ordered[i])
+                    woven.append(ordered[j])
+                i += 1
+                j -= 1
+            region_ids = woven
+
     # Decide how many regions to color per emitted frame
-    # For human-like mode, emit a frame for every colored region to reduce pauses.
+    # Optionally accelerate: start with fewer regions per frame, then increase.
     regions_per_frame = 1 if human_like else max(1, math.ceil(len(region_ids) / total_frames_target))
 
     # Prepare the writer
@@ -247,9 +564,20 @@ def fill_regions_progressively(
     try:
         current = img_bgr.copy()
         frames_written = 0
+        latest_color_bgr: Tuple[int, int, int] | None = None
+        # Preserve the original top band exactly, never modify it in output frames
+        if exclude_top_px > 0:
+            top_preserve_h = min(exclude_top_px, h)
+            original_top = img_bgr[:top_preserve_h, :].copy()
+        else:
+            top_preserve_h = 0
+            original_top = None
+        last_emitted_frame: np.ndarray | None = None
         colored = np.zeros_like(white_mask, dtype=bool)
 
+        # Conservative dilation to hug outlines without crossing
         kernel_dilate = np.ones((2, 2), np.uint8)
+        dilate_iter = 1
         # Decide the set of colors allowed for this run (limit by max_colors)
         # For non-human mode, use a random subset of PALETTE_BGR.
         # For human-like mode, derive an ordered palette then reduce to unique up to the limit.
@@ -300,7 +628,13 @@ def fill_regions_progressively(
                 y1 = min(lab.shape[0], y + h + 1)
                 x1 = min(lab.shape[1], x + w + 1)
                 window = lab[y0:y1, x0:x1]
+                if window.size == 0:
+                    neighbor_map[rid] = set()
+                    continue
                 m = (window == rid).astype(np.uint8) * 255
+                if m.size == 0:
+                    neighbor_map[rid] = set()
+                    continue
                 md = cv2.dilate(m, k3, iterations=1)
                 ring = (md > 0) & (m == 0)
                 neigh = set(np.unique(window[ring]).tolist())
@@ -309,6 +643,69 @@ def fill_regions_progressively(
                 neighbor_map[rid] = neigh
 
         assigned_color: dict[int, Tuple[int, int, int]] = {}
+
+        # Build an accelerating schedule if requested
+        chunks: List[int] | None = None
+        if accelerate:
+            total_regions = len(region_ids)
+            tail_frames_expected = int(round(tail_secs * fps))
+            color_frames_target = max(1, total_frames_target - tail_frames_expected)
+            # Ensure acceleration is visible even when regions < color frames:
+            # compress the number of coloring frames to ~60% of regions (but cap by target frames).
+            frames_for_coloring = max(1, min(color_frames_target, int(max(1, round(total_regions * 0.6)))))
+            # Weight later frames heavier to accelerate; alpha controls curvature
+            alpha = 2.0
+            weights = [(k + 1) ** alpha for k in range(frames_for_coloring)]
+            sw = sum(weights)
+            raw = [total_regions * w / sw for w in weights]
+            ints = [max(1, int(math.floor(x))) for x in raw]
+            diff = total_regions - sum(ints)
+            if diff > 0:
+                # Distribute remaining regions to frames with largest fractional parts
+                fracs = [x - math.floor(x) for x in raw]
+                order = sorted(range(frames_for_coloring), key=lambda i: fracs[i], reverse=True)
+                for idx in order:
+                    if diff <= 0:
+                        break
+                    ints[idx] += 1
+                    diff -= 1
+            elif diff < 0:
+                # Remove extras from earliest frames while keeping at least 1
+                need = -diff
+                for idx in range(frames_for_coloring):
+                    if need <= 0:
+                        break
+                    take = min(need, max(0, ints[idx] - 1))
+                    ints[idx] -= take
+                    need -= take
+                # If still need to trim, remove from the end
+                idx = frames_for_coloring - 1
+                while need > 0 and idx >= 0:
+                    take = min(need, max(0, ints[idx] - 1))
+                    ints[idx] -= take
+                    need -= take
+                    idx -= 1
+            # Ensure non-decreasing sequence
+            for k in range(1, frames_for_coloring):
+                if ints[k] < ints[k - 1]:
+                    inc = ints[k - 1] - ints[k]
+                    ints[k] += inc
+            # Fix sum if grew due to monotonic enforcement
+            over = sum(ints) - total_regions
+            idx = frames_for_coloring - 1
+            while over > 0 and idx >= 0:
+                reducible = max(0, ints[idx] - 1)
+                take = min(over, reducible)
+                ints[idx] -= take
+                over -= take
+                idx -= 1
+            chunks = ints
+
+        # Iterate regions and emit frames according to schedule
+        colored_in_chunk = 0
+        next_chunk_target = chunks[0] if accelerate and chunks else regions_per_frame
+        chunk_index = 0
+
         for i, region_id in enumerate(region_ids, start=1):
             # Assign a color for this region
             if human_like:
@@ -330,22 +727,94 @@ def fill_regions_progressively(
             else:
                 # Pick from the limited allowed palette
                 color = rng.choice(allowed_colors)
-            mask = labels == region_id
-            # Slightly dilate region mask to cover tiny gaps, but never over lines
-            m8 = (mask.astype(np.uint8) * 255)
-            m8 = cv2.dilate(m8, kernel_dilate, iterations=1)
-            mask = (m8 > 0) & (~line_mask.astype(bool))
-            colored |= mask
-            current[mask] = color
+            # Build a robust per-region mask on a local ROI and fill tiny holes
+            rx, ry, rw, rh = (
+                int(stats[region_id, cv2.CC_STAT_LEFT]),
+                int(stats[region_id, cv2.CC_STAT_TOP]),
+                int(stats[region_id, cv2.CC_STAT_WIDTH]),
+                int(stats[region_id, cv2.CC_STAT_HEIGHT]),
+            )
+            pad = 3
+            y0 = max(0, ry - pad)
+            x0 = max(0, rx - pad)
+            y1 = min(h, ry + rh + pad)
+            x1 = min(w, rx + rw + pad)
+            if y1 <= y0 or x1 <= x0:
+                # Fallback to whole-image path for safety
+                mask = labels == region_id
+                m8 = (mask.astype(np.uint8) * 255)
+                if m8.size > 0:
+                    m8 = cv2.dilate(m8, kernel_dilate, iterations=dilate_iter)
+                mask = (m8 > 0) & (~line_mask.astype(bool))
+                colored |= mask
+                current[mask] = color
+            else:
+                roi_labels = labels[y0:y1, x0:x1]
+                roi_line = line_mask[y0:y1, x0:x1]
+                base = (roi_labels == region_id)
+                if base.size == 0:
+                    # Fallback
+                    mask = labels == region_id
+                    m8 = (mask.astype(np.uint8) * 255)
+                    if m8.size > 0:
+                        m8 = cv2.dilate(m8, kernel_dilate, iterations=dilate_iter)
+                        mask = (m8 > 0) & (~line_mask.astype(bool))
+                        colored |= mask
+                        current[mask] = color
+                    else:
+                        # Nothing to do
+                        pass
+                else:
+                    m8 = (base.astype(np.uint8) * 255)
+                    if m8.size > 0:
+                        # Slightly dilate to hug outlines
+                        m8 = cv2.dilate(m8, kernel_dilate, iterations=dilate_iter)
+                        # Fill small internal holes within the region ROI
+                        ff = m8.copy()
+                        ff_mask = np.zeros((ff.shape[0] + 2, ff.shape[1] + 2), np.uint8)
+                        # Ensure seed is background by forcing ROI corners to 0
+                        if ff.shape[0] > 0 and ff.shape[1] > 0:
+                            ff[0, 0] = 0
+                            ff[0, -1] = 0
+                            ff[-1, 0] = 0
+                            ff[-1, -1] = 0
+                        cv2.floodFill(ff, ff_mask, (0, 0), 255)
+                        inv = cv2.bitwise_not(ff)  # pixels not reachable from border -> holes
+                        filled = cv2.bitwise_or(m8, inv)
+                    else:
+                        filled = m8
+                    roi_mask = (filled > 0) & (~roi_line.astype(bool))
+                    # Apply to current frame
+                    sub = current[y0:y1, x0:x1]
+                    sub[roi_mask] = color
+                    current[y0:y1, x0:x1] = sub
+                    # Track colored map (optional)
+                    colored[y0:y1, x0:x1] |= roi_mask
             assigned_color[region_id] = color
+            latest_color_bgr = color
 
-            # Emit a frame every `regions_per_frame` colored regions
-            if i % regions_per_frame == 0:
+            # Emit frames based on accelerating schedule or fixed cadence
+            colored_in_chunk += 1
+            if colored_in_chunk >= next_chunk_target:
                 frame = current.copy()
                 # Reimpose linework to keep outlines crisp
                 frame[line_mask.astype(bool)] = (0, 0, 0)
+                # Restore top band exactly as original to avoid any changes there
+                if top_preserve_h > 0 and original_top is not None:
+                    frame[:top_preserve_h, :] = original_top
+                # Finally, draw the UI circle with the current color so it updates
+                # even if it lives in the preserved top band.
+                if ui_circle is not None and latest_color_bgr is not None:
+                    _draw_ui_circle(frame, ui_circle, latest_color_bgr)
                 writer.write(frame)
                 frames_written += 1
+                last_emitted_frame = frame
+                colored_in_chunk = 0
+                if accelerate and chunks is not None:
+                    chunk_index += 1
+                    if chunk_index < len(chunks):
+                        next_chunk_target = chunks[chunk_index]
+                # else keep using regions_per_frame
 
         # After finishing all regions, hold the final image for tail_secs seconds
         # (composition may place splash over a portion of this tail)
@@ -353,11 +822,22 @@ def fill_regions_progressively(
         final_frame[line_mask.astype(bool)] = (0, 0, 0)
         tail_frames = int(round(tail_secs * fps))
         for _ in range(tail_frames):
-            writer.write(final_frame)
+            # Keep showing last used color in the UI circle during the tail
+            frame_tail = final_frame.copy()
+            # Restore top band exactly as original
+            if top_preserve_h > 0 and original_top is not None:
+                frame_tail[:top_preserve_h, :] = original_top
+            # Then overlay the current-color circle so it reflects the last color
+            if ui_circle is not None and latest_color_bgr is not None:
+                _draw_ui_circle(frame_tail, ui_circle, latest_color_bgr)
+            writer.write(frame_tail)
             frames_written += 1
+            last_emitted_frame = frame_tail
     finally:
         writer.release()
-    return frames_written, fps, final_frame
+    if last_emitted_frame is None:
+        last_emitted_frame = final_frame
+    return frames_written, fps, last_emitted_frame
 
 
 def pick_random_png(pics_dir: Path) -> Path:
@@ -411,6 +891,8 @@ def process_single_image(
     CODEC: str,
     HUMAN_LIKE: bool,
     MAX_COLORS: int,
+    ACCELERATE: bool,
+    PATTERN: str,
 ):
     img = cv2.imread(str(input_path), cv2.IMREAD_COLOR)
     if img is None:
@@ -423,6 +905,9 @@ def process_single_image(
     FADE_IN = 2.0     # slower fade-in for smoother transition
     POST_HOLD = 3.0   # seconds splash remains fully visible
     TAIL = PRE_HOLD + FADE_IN + POST_HOLD
+
+    # Override UI circle location: user-provided absolute coordinates for the swatch
+    UI_CIRCLE_POS_ABS: tuple[int, int] | None = (980, 590)
 
     frames_written, out_fps, final_frame = fill_regions_progressively(
         img,
@@ -439,6 +924,12 @@ def process_single_image(
         min_region_area=100,
         tail_secs=TAIL,
         max_colors=MAX_COLORS,
+        accelerate=ACCELERATE,
+        ui_circle_pos=UI_CIRCLE_POS_ABS,
+        ui_circle_pos_is_normalized=False,
+        # Exclude the top-left rectangle: x<925 and y<650
+        exclude_rect=(0, 0, 925, 650),
+        pattern=PATTERN,
     )
 
     # Save last frame
@@ -528,8 +1019,9 @@ def main():
     # Configuration constants (can later be added to the GUI)
     DURATION = 20.0  # seconds
     FPS = 30
-    WHITE_THRESH = 240  # accept slightly more near-white as white
-    BLACK_THRESH = 50
+    # Increase tolerance for near-white edge pixels and near-black anti-aliased lines
+    WHITE_THRESH = 230
+    BLACK_THRESH = 80
     EXCLUDE_TOP = 500
     EXCLUDE_BOTTOM = 500
     CODEC = "mp4v"  # try "MJPG" if mp4v doesn't work on your system
@@ -545,7 +1037,12 @@ def main():
     # Build GUI --------------------------------------------------------------
     root = tk.Tk()
     root.title("Color Fill Video Generator")
-    root.geometry("460x320")
+    # Make the default window larger so resizing isn't needed each run
+    root.geometry("800x640")
+    try:
+        root.minsize(720, 560)
+    except Exception:
+        pass
 
     frm = ttk.Frame(root, padding=12)
     frm.pack(expand=True, fill=tk.BOTH)
@@ -571,21 +1068,48 @@ def main():
     chk = ttk.Checkbutton(rand_frame, text="True random off (human-like)", variable=human_var)
     chk.pack(anchor="w")
 
-    # Randomly choose per video between human-like and true random
+    # Pattern option
+    pattern_frame = ttk.Frame(frm)
+    pattern_frame.pack(fill=tk.X, pady=(12, 0))
+    ttk.Label(pattern_frame, text="Coloring pattern:").pack(anchor="w")
+    pattern_enable_var = tk.BooleanVar(value=False)
+    pattern_enable_chk = ttk.Checkbutton(pattern_frame, text="Enable pattern", variable=pattern_enable_var)
+    pattern_enable_chk.pack(anchor="w")
+    pattern_var = tk.StringVar(value="Auto")
+    cmb = ttk.Combobox(pattern_frame, textvariable=pattern_var, state="disabled")
+    cmb['values'] = ("Auto", "Top-to-bottom", "Left-to-right", "Center-out", "Angle sweep", "Special")
+    cmb.current(0)
+    cmb.pack(fill=tk.X)
+
+    def on_toggle_pattern_enable():
+        cmb.config(state=("readonly" if pattern_enable_var.get() else "disabled"))
+    pattern_enable_chk.config(command=on_toggle_pattern_enable)
+
+    # Acceleration option
+    accel_frame = ttk.Frame(frm)
+    accel_frame.pack(fill=tk.X, pady=(8, 0))
+    accelerate_var = tk.BooleanVar(value=False)
+    accel_chk = ttk.Checkbutton(accel_frame, text="Start slow, then accelerate", variable=accelerate_var)
+    accel_chk.pack(anchor="w")
+
+    # Randomly choose per video (affects human-like, accelerate, pattern, max colors)
     random_per_video_var = tk.BooleanVar(value=False)
     def on_toggle_random_per_video():
-        # Grey/disable the human-like option when random-per-video is enabled
-        if random_per_video_var.get():
-            chk.config(state=tk.DISABLED)
-        else:
-            chk.config(state=tk.NORMAL)
-    random_chk = ttk.Checkbutton(
-        rand_frame,
+        state = tk.DISABLED if random_per_video_var.get() else tk.NORMAL
+        # Grey/disable inputs when random-per-video is enabled
+        chk.config(state=state)
+        accel_chk.config(state=state)
+        pattern_enable_chk.config(state=state)
+        cmb.config(state=("disabled" if random_per_video_var.get() else ("readonly" if pattern_enable_var.get() else "disabled")))
+    rand_all_frame = ttk.Frame(frm)
+    rand_all_frame.pack(fill=tk.X, pady=(12, 0))
+    random_chk2 = ttk.Checkbutton(
+        rand_all_frame,
         text="Randomly choose mode per video",
         variable=random_per_video_var,
         command=on_toggle_random_per_video,
     )
-    random_chk.pack(anchor="w")
+    random_chk2.pack(anchor="w")
 
     # Max distinct colors per video slider
     colors_frame = ttk.Frame(frm)
@@ -654,19 +1178,39 @@ def main():
                 if len(imgs_cycle) > 1:
                     imgs_cycle = img_rng.sample(imgs_cycle, len(imgs_cycle))
                 total = n
-                # Use a cryptographically-strong RNG for mode selection to avoid any prior seeding
+                # Use a cryptographically-strong RNG for random-per-video selections
                 mode_rng = random.SystemRandom()
                 for i in range(n):
                     if cancel_flag["stop"]:
                         break
                     img_path = imgs_cycle[i % len(imgs_cycle)]
-                    # Decide coloring mode for this video
+                    # Decide options for this video
                     if random_per_video_var.get():
                         current_human_like = bool(mode_rng.getrandbits(1))
+                        current_accelerate = bool(mode_rng.getrandbits(1))
+                        # Pattern enabled?
+                        use_pattern = bool(mode_rng.getrandbits(1))
+                        # Choose a pattern if enabled
+                        patterns = [
+                            "Top-to-bottom",
+                            "Left-to-right",
+                            "Center-out",
+                            "Angle sweep",
+                            "Special",
+                        ]
+                        current_pattern = mode_rng.choice(patterns) if use_pattern else None
+                        # Randomize max colors between 3 and full palette
+                        current_max_colors = mode_rng.randrange(3, len(PALETTE_BGR) + 1)
                     else:
                         current_human_like = bool(human_var.get())
+                        current_accelerate = bool(accelerate_var.get())
+                        current_pattern = pattern_var.get() if bool(pattern_enable_var.get()) else None
+                        current_max_colors = int(max_colors_var.get())
 
-                    mode_label = "human-like" if current_human_like else "true random"
+                    pretty_pattern = current_pattern if current_pattern is not None else ("Auto" if bool(pattern_enable_var.get()) else "Off")
+                    mode_label = (
+                        f"{'human-like' if current_human_like else 'true random'} | accel={'on' if current_accelerate else 'off'} | pattern={pretty_pattern} | colors={current_max_colors}"
+                    )
                     status_var.set(f"Processing {i+1}/{total}: {img_path.name} ({mode_label})")
                     root.update_idletasks()
                     process_single_image(
@@ -681,7 +1225,9 @@ def main():
                         EXCLUDE_BOTTOM,
                         CODEC,
                         current_human_like,
-                        int(max_colors_var.get()),
+                        int(current_max_colors),
+                        bool(current_accelerate),
+                        current_pattern if current_pattern is not None else (pattern_var.get() if bool(pattern_enable_var.get()) else None),
                     )
                     pbar.config(value=((i + 1) / total) * 100)
             except Exception as e:
