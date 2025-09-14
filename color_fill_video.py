@@ -868,6 +868,26 @@ def next_unique_image_path(folder: Path, stem: str, suffix: str) -> Path:
     return next_unique_path(folder, stem, suffix)
 
 
+def _sanitize_filename_component(s: str) -> str:
+    """Return a version of `s` that is safe for Windows filenames.
+
+    Replaces illegal characters with '-'. Ensures no trailing space/dot.
+    Keeps readability (spaces, parentheses, dashes, equals are allowed).
+    """
+    # Windows disallows: < > : " / \ | ? * and control chars
+    forbidden = set('<>:"/\\|?*')
+    cleaned = []
+    for ch in s:
+        if ord(ch) < 32 or ch in forbidden:
+            cleaned.append('-')
+        else:
+            cleaned.append(ch)
+    out = ''.join(cleaned).strip()
+    # Avoid trailing dot/space which can cause issues on Windows
+    out = out.rstrip(' .')
+    return out
+
+
 def pick_random_music(music_dir: Path) -> Path | None:
     if not music_dir.exists():
         return None
@@ -994,7 +1014,19 @@ def process_single_image(
         except Exception:
             pass
 
-    output_path = next_unique_path(finished_dir, input_path.stem, ".mp4")
+    # Include mode details in the output filename, sanitized for Windows
+    pretty_pattern = (
+        str(PATTERN).strip() if PATTERN is not None and str(PATTERN).strip() else "Off"
+    )
+    mode_text = (
+        f"(human-like | accel={'on' if ACCELERATE else 'off'} | pattern={pretty_pattern} | colors={MAX_COLORS})"
+        if HUMAN_LIKE
+        else f"(true-random | accel={'on' if ACCELERATE else 'off'} | pattern={pretty_pattern} | colors={MAX_COLORS})"
+    )
+    # Replace illegal characters (notably '|' on Windows) while keeping readability
+    safe_mode = _sanitize_filename_component(mode_text)
+    stem_with_mode = f"{input_path.stem} {safe_mode}" if safe_mode else input_path.stem
+    output_path = next_unique_path(finished_dir, stem_with_mode, ".mp4")
     final_clip.write_videofile(
         str(output_path),
         fps=FPS,
