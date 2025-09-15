@@ -420,7 +420,7 @@ def fill_regions_progressively(
     white_thresh: int = 240,
     black_thresh: int = 50,
     exclude_top_px: int = 500,
-    exclude_bottom_px: int = 500,
+    exclude_bottom_px: int = 400,
     codec: str = "mp4v",
     output_path: str = "output.mp4",
     human_like: bool = False,
@@ -565,13 +565,19 @@ def fill_regions_progressively(
         current = img_bgr.copy()
         frames_written = 0
         latest_color_bgr: Tuple[int, int, int] | None = None
-        # Preserve the original top band exactly, never modify it in output frames
+        # Preserve the original top/bottom bands exactly so UI chrome remains untouched
         if exclude_top_px > 0:
             top_preserve_h = min(exclude_top_px, h)
             original_top = img_bgr[:top_preserve_h, :].copy()
         else:
             top_preserve_h = 0
             original_top = None
+        if exclude_bottom_px > 0:
+            bottom_preserve_h = min(exclude_bottom_px, h)
+            original_bottom = img_bgr[h - bottom_preserve_h :, :].copy()
+        else:
+            bottom_preserve_h = 0
+            original_bottom = None
         last_emitted_frame: np.ndarray | None = None
         colored = np.zeros_like(white_mask, dtype=bool)
 
@@ -799,11 +805,17 @@ def fill_regions_progressively(
                 frame = current.copy()
                 # Reimpose linework to keep outlines crisp
                 frame[line_mask.astype(bool)] = (0, 0, 0)
-                # Restore top band exactly as original to avoid any changes there
+                # Restore top/bottom bands exactly as original to avoid any changes there
                 if top_preserve_h > 0 and original_top is not None:
-                    frame[:top_preserve_h, :] = original_top
+                    top_h = min(top_preserve_h, frame.shape[0], original_top.shape[0])
+                    if top_h > 0:
+                        frame[:top_h, :] = original_top[:top_h, :]
+                if bottom_preserve_h > 0 and original_bottom is not None:
+                    bottom_h = min(bottom_preserve_h, frame.shape[0], original_bottom.shape[0])
+                    if bottom_h > 0:
+                        frame[-bottom_h:, :] = original_bottom[-bottom_h:, :]
                 # Finally, draw the UI circle with the current color so it updates
-                # even if it lives in the preserved top band.
+                # even if it lives inside the preserved UI bands.
                 if ui_circle is not None and latest_color_bgr is not None:
                     _draw_ui_circle(frame, ui_circle, latest_color_bgr)
                 writer.write(frame)
@@ -824,9 +836,15 @@ def fill_regions_progressively(
         for _ in range(tail_frames):
             # Keep showing last used color in the UI circle during the tail
             frame_tail = final_frame.copy()
-            # Restore top band exactly as original
+            # Restore top/bottom bands exactly as original
             if top_preserve_h > 0 and original_top is not None:
-                frame_tail[:top_preserve_h, :] = original_top
+                top_h = min(top_preserve_h, frame_tail.shape[0], original_top.shape[0])
+                if top_h > 0:
+                    frame_tail[:top_h, :] = original_top[:top_h, :]
+            if bottom_preserve_h > 0 and original_bottom is not None:
+                bottom_h = min(bottom_preserve_h, frame_tail.shape[0], original_bottom.shape[0])
+                if bottom_h > 0:
+                    frame_tail[-bottom_h:, :] = original_bottom[-bottom_h:, :]
             # Then overlay the current-color circle so it reflects the last color
             if ui_circle is not None and latest_color_bgr is not None:
                 _draw_ui_circle(frame_tail, ui_circle, latest_color_bgr)
@@ -1009,7 +1027,7 @@ def process_single_image(
             if audio.duration > final_clip.duration:
                 audio = audio.subclip(0, final_clip.duration)
             # Make the background music subtle
-            audio = audio.fx(afx.volumex, 0.2)
+            audio = audio.fx(afx.volumex, 0.1)
             final_clip = final_clip.set_audio(audio)
         except Exception:
             pass
@@ -1055,7 +1073,7 @@ def main():
     WHITE_THRESH = 230
     BLACK_THRESH = 80
     EXCLUDE_TOP = 500
-    EXCLUDE_BOTTOM = 500
+    EXCLUDE_BOTTOM = 400
     CODEC = "mp4v"  # try "MJPG" if mp4v doesn't work on your system
     MIN_REGION_AREA = 100  # ignore regions smaller than 10x10 pixels
 
